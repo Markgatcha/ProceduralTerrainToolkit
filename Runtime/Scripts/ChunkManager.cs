@@ -9,12 +9,16 @@ namespace ProceduralTerrainToolkit
     {
         [Header("Scene References")]
         [SerializeField]
-        [Tooltip("Player or vehicle transform that drives terrain streaming.")]
+        [Tooltip("Player, vehicle, or camera transform that drives chunk streaming.")]
         private Transform viewer;
 
         [SerializeField]
-        [Tooltip("Shared material assigned to every generated terrain chunk.")]
+        [Tooltip("Shared material assigned to every generated chunk.")]
         private Material terrainMaterial;
+
+        [SerializeField]
+        [Tooltip("Optional compute shader used when GPU terrain noise generation is enabled.")]
+        private ComputeShader noiseComputeShader;
 
         [Header("Streaming")]
         [SerializeField]
@@ -24,12 +28,12 @@ namespace ProceduralTerrainToolkit
 
         [SerializeField]
         [Min(0.01f)]
-        [Tooltip("Minimum time between chunk visibility refreshes.")]
+        [Tooltip("Minimum time between visibility refreshes.")]
         private float updateIntervalSeconds = 0.1f;
 
         [SerializeField]
         [Min(0f)]
-        [Tooltip("Distance the viewer must move before an early refresh is triggered.")]
+        [Tooltip("Distance the viewer must move before forcing an early refresh.")]
         private float viewerMovementThreshold = 8f;
 
         [Header("Generation")]
@@ -43,13 +47,16 @@ namespace ProceduralTerrainToolkit
         private readonly Queue<TerrainChunk> pooledChunks = new Queue<TerrainChunk>();
         private readonly HashSet<Vector2Int> requiredCoordinates = new HashSet<Vector2Int>();
         private readonly List<Vector2Int> recycleBuffer = new List<Vector2Int>();
+        private readonly List<TerrainChunk> coolingDownChunks = new List<TerrainChunk>();
 
-        private NoiseSamplingContext noiseContext;
+        private TerrainNoiseParameters noiseParameters;
+        private GpuNoiseGenerator gpuNoiseGenerator;
         private Transform chunkRoot;
         private Vector3 lastViewerPosition;
         private float nextRefreshTime;
         private bool runtimeReady;
         private bool settingsDirty;
+        private bool hasLoggedGpuFallback;
         private int createdChunkCount;
 
         public int ActiveChunkCount => activeChunks.Count;
@@ -79,9 +86,15 @@ namespace ProceduralTerrainToolkit
                 return;
             }
 
+            ServiceChunkPipelines();
+
             if (settingsDirty)
             {
-                noiseContext = NoiseGenerator.CreateContext(noiseSettings);
+                if (!RefreshNoiseConfiguration())
+                {
+                    return;
+                }
+
                 RefreshVisibleChunks(forceRebuildExisting: true);
                 settingsDirty = false;
                 lastViewerPosition = viewer.position;
@@ -116,6 +129,11 @@ namespace ProceduralTerrainToolkit
             settingsDirty = true;
         }
 
+        private void OnDestroy()
+        {
+            gpuNoiseGenerator?.Dispose();
+        }
+
         [ContextMenu("Force Refresh Visible Chunks")]
         public void ForceRefresh()
         {
@@ -134,7 +152,11 @@ namespace ProceduralTerrainToolkit
                 }
             }
 
-            noiseContext = NoiseGenerator.CreateContext(noiseSettings);
+            if (!RefreshNoiseConfiguration())
+            {
+                return;
+            }
+
             RefreshVisibleChunks(forceRebuildExisting: true);
             settingsDirty = false;
             lastViewerPosition = viewer.position;
@@ -201,10 +223,57 @@ namespace ProceduralTerrainToolkit
             }
 
             EnsureChunkRoot();
-            noiseContext = NoiseGenerator.CreateContext(noiseSettings);
+
+            if (!RefreshNoiseConfiguration())
+            {
+                enabled = false;
+                return false;
+            }
+
             lastViewerPosition = viewer.position;
             nextRefreshTime = 0f;
             enabled = true;
+            return true;
+        }
+
+        private bool RefreshNoiseConfiguration()
+        {
+            noiseSettings.Validate();
+            noiseParameters = NoiseGenerator.CreateParameters(noiseSettings);
+
+            if (!noiseParameters.SupportsAsyncChunkGeneration)
+            {
+                Debug.LogError(
+                    "Asynchronous chunk generation currently supports only Global normalization for height, moisture, and temperature maps.",
+                    this);
+                return false;
+            }
+
+            gpuNoiseGenerator?.Dispose();
+            gpuNoiseGenerator = null;
+
+            if (noiseParameters.GenerationBackend != TerrainGenerationBackend.GpuComputeAsync)
+            {
+                hasLoggedGpuFallback = false;
+                return true;
+            }
+
+            if (noiseComputeShader == null)
+            {
+                LogGpuFallback("GPU noise generation is enabled, but no NoiseGenerator.compute shader has been assigned. Falling back to Burst CPU jobs.");
+                return true;
+            }
+
+            gpuNoiseGenerator = new GpuNoiseGenerator(noiseComputeShader);
+            if (!gpuNoiseGenerator.IsSupported)
+            {
+                gpuNoiseGenerator.Dispose();
+                gpuNoiseGenerator = null;
+                LogGpuFallback("GPU noise generation is enabled, but this device does not support compute shaders with AsyncGPUReadback. Falling back to Burst CPU jobs.");
+                return true;
+            }
+
+            hasLoggedGpuFallback = false;
             return true;
         }
 
@@ -238,7 +307,7 @@ namespace ProceduralTerrainToolkit
                         if (forceRebuildExisting)
                         {
                             existingChunk.Configure(terrainChunkSettings, terrainMaterial);
-                            existingChunk.Build(coordinate, in noiseContext);
+                            existingChunk.RequestBuild(coordinate, noiseParameters, gpuNoiseGenerator);
                         }
                         else
                         {
@@ -250,7 +319,7 @@ namespace ProceduralTerrainToolkit
 
                     TerrainChunk chunk = AcquireChunk();
                     chunk.Configure(terrainChunkSettings, terrainMaterial);
-                    chunk.Build(coordinate, in noiseContext);
+                    chunk.RequestBuild(coordinate, noiseParameters, gpuNoiseGenerator);
                     activeChunks.Add(coordinate, chunk);
                 }
             }
@@ -263,9 +332,29 @@ namespace ProceduralTerrainToolkit
                 }
             }
 
-            for (int i = 0; i < recycleBuffer.Count; i++)
+            for (int index = 0; index < recycleBuffer.Count; index++)
             {
-                RecycleChunk(recycleBuffer[i]);
+                RecycleChunk(recycleBuffer[index]);
+            }
+        }
+
+        private void ServiceChunkPipelines()
+        {
+            foreach (KeyValuePair<Vector2Int, TerrainChunk> pair in activeChunks)
+            {
+                pair.Value.TickGeneration();
+            }
+
+            for (int index = coolingDownChunks.Count - 1; index >= 0; index--)
+            {
+                TerrainChunk chunk = coolingDownChunks[index];
+                chunk.TickGeneration();
+
+                if (chunk.CanEnterPool)
+                {
+                    coolingDownChunks.RemoveAt(index);
+                    pooledChunks.Enqueue(chunk);
+                }
             }
         }
 
@@ -292,7 +381,15 @@ namespace ProceduralTerrainToolkit
             TerrainChunk chunk = activeChunks[coordinate];
             activeChunks.Remove(coordinate);
             chunk.ReleaseToPool();
-            pooledChunks.Enqueue(chunk);
+
+            if (chunk.CanEnterPool)
+            {
+                pooledChunks.Enqueue(chunk);
+            }
+            else
+            {
+                coolingDownChunks.Add(chunk);
+            }
         }
 
         private Vector2Int WorldToChunkCoordinate(Vector3 worldPosition)
@@ -357,6 +454,17 @@ namespace ProceduralTerrainToolkit
                 noiseSettings = new NoiseSettings();
                 Debug.LogWarning("ChunkManager restored missing NoiseSettings with default values.", this);
             }
+        }
+
+        private void LogGpuFallback(string message)
+        {
+            if (hasLoggedGpuFallback)
+            {
+                return;
+            }
+
+            hasLoggedGpuFallback = true;
+            Debug.LogWarning(message, this);
         }
     }
 }

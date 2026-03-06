@@ -1,0 +1,58 @@
+name: Beta Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read package version
+        id: package
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('package.json', encoding='utf-8'))['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$TAG_VERSION" != "${{ steps.package.outputs.version }}" ]; then
+            echo "Tag version $TAG_VERSION does not match package.json version ${{ steps.package.outputs.version }}"
+            exit 1
+          fi
+
+      - name: Build beta package archives
+        run: |
+          PACKAGE_NAME="ProceduralTerrainToolkit"
+          PACKAGE_VERSION="${{ steps.package.outputs.version }}"
+          STAGING_ROOT="build/${PACKAGE_NAME}"
+
+          mkdir -p "$STAGING_ROOT"
+
+          rsync -av \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'build' \
+            ./ "$STAGING_ROOT"/
+
+          cd build
+          zip -r "${PACKAGE_NAME}-${PACKAGE_VERSION}.zip" "${PACKAGE_NAME}"
+          tar -czf "${PACKAGE_NAME}-${PACKAGE_VERSION}.tgz" "${PACKAGE_NAME}"
+
+      - name: Create GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            build/ProceduralTerrainToolkit-${{ steps.package.outputs.version }}.zip
+            build/ProceduralTerrainToolkit-${{ steps.package.outputs.version }}.tgz

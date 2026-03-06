@@ -1,65 +1,178 @@
 using System;
+using Unity.Mathematics;
 using UnityEngine;
 
 namespace ProceduralTerrainToolkit
 {
     public enum NoiseNormalizationMode
     {
-        Local,
-        Global
+        Global,
+        Local
+    }
+
+    public enum TerrainGenerationBackend
+    {
+        CpuBurstJobs,
+        GpuComputeAsync
     }
 
     [Serializable]
-    public sealed class NoiseSettings
+    public sealed class NoiseChannelSettings
     {
-        [Tooltip("Seed used to build deterministic octave offsets.")]
-        public int seed = 1337;
+        [Tooltip("Offset added to the shared terrain seed so each channel remains decorrelated.")]
+        public int seedOffset;
 
         [Min(0.0001f)]
-        [Tooltip("Larger values zoom the noise out. Smaller values make terrain detail denser.")]
+        [Tooltip("Larger values spread the pattern over a wider area.")]
         public float scale = 128f;
 
         [Min(1)]
-        [Tooltip("Number of layered Perlin noise octaves blended together.")]
+        [Tooltip("Number of fractal octaves blended together.")]
         public int octaves = 4;
 
         [Range(0f, 1f)]
-        [Tooltip("Amplitude multiplier applied after each octave.")]
+        [Tooltip("Amplitude decay applied after each octave.")]
         public float persistence = 0.5f;
 
         [Min(1f)]
         [Tooltip("Frequency multiplier applied after each octave.")]
         public float lacunarity = 2f;
 
-        [Tooltip("Global offset applied before seeded octave offsets are added.")]
+        [Tooltip("Additional world-space offset for this noise channel.")]
         public Vector2 offset = Vector2.zero;
 
-        [Tooltip("Global normalization preserves seamless streaming. Local normalization increases per-chunk contrast.")]
+        [Tooltip("Async chunk generation currently requires global normalization so each chunk agrees on the same range.")]
         public NoiseNormalizationMode normalizationMode = NoiseNormalizationMode.Global;
 
         public void Validate()
         {
             scale = Mathf.Max(0.0001f, scale);
-            octaves = Mathf.Max(1, octaves);
+            octaves = Mathf.Clamp(octaves, 1, 12);
             persistence = Mathf.Clamp01(persistence);
             lacunarity = Mathf.Max(1f, lacunarity);
         }
     }
 
-    public readonly struct NoiseSamplingContext
+    [Serializable]
+    public sealed class NoiseSettings
     {
-        private readonly Vector2[] octaveOffsets;
+        [Tooltip("Base seed shared by height, moisture, and temperature channels.")]
+        public int baseSeed = 1337;
+
+        [Tooltip("CPU Burst jobs are the universal fallback. GPU compute is used when requested and supported.")]
+        public TerrainGenerationBackend generationBackend = TerrainGenerationBackend.CpuBurstJobs;
+
+        [Tooltip("Height map controls the terrain shape that drives mesh displacement.")]
+        public NoiseChannelSettings height = new NoiseChannelSettings();
+
+        [Tooltip("Moisture map controls how wet, grassy, or sandy a surface should appear.")]
+        public NoiseChannelSettings moisture = new NoiseChannelSettings
+        {
+            seedOffset = 701,
+            scale = 192f,
+            octaves = 4,
+            persistence = 0.55f,
+            lacunarity = 2.05f,
+            offset = new Vector2(61f, 19f),
+            normalizationMode = NoiseNormalizationMode.Global
+        };
+
+        [Tooltip("Temperature map controls hot/cold biome blending and snow placement.")]
+        public NoiseChannelSettings temperature = new NoiseChannelSettings
+        {
+            seedOffset = 1543,
+            scale = 256f,
+            octaves = 3,
+            persistence = 0.6f,
+            lacunarity = 1.95f,
+            offset = new Vector2(-37f, 83f),
+            normalizationMode = NoiseNormalizationMode.Global
+        };
+
+        public void Validate()
+        {
+            if (height == null)
+            {
+                height = new NoiseChannelSettings();
+            }
+
+            if (moisture == null)
+            {
+                moisture = new NoiseChannelSettings();
+            }
+
+            if (temperature == null)
+            {
+                temperature = new NoiseChannelSettings();
+            }
+
+            height.Validate();
+            moisture.Validate();
+            temperature.Validate();
+        }
+    }
+
+    public readonly struct NoiseChannelParameters
+    {
+        public NoiseChannelParameters(
+            int seed,
+            float scale,
+            int octaves,
+            float persistence,
+            float lacunarity,
+            float2 offset,
+            NoiseNormalizationMode normalizationMode,
+            float maxPossibleHeight)
+        {
+            Seed = seed;
+            Scale = scale;
+            Octaves = octaves;
+            Persistence = persistence;
+            Lacunarity = lacunarity;
+            Offset = offset;
+            NormalizationMode = normalizationMode;
+            MaxPossibleHeight = math.max(maxPossibleHeight, 0.0001f);
+        }
 
         public int Seed { get; }
         public float Scale { get; }
         public int Octaves { get; }
         public float Persistence { get; }
         public float Lacunarity { get; }
+        public float2 Offset { get; }
         public NoiseNormalizationMode NormalizationMode { get; }
         public float MaxPossibleHeight { get; }
-        public bool IsValid => octaveOffsets != null && octaveOffsets.Length == Octaves && Octaves > 0 && Scale > 0f;
+        public bool SupportsAsyncSampling => NormalizationMode == NoiseNormalizationMode.Global;
+    }
 
-        public NoiseSamplingContext(NoiseSettings settings)
+    public readonly struct TerrainNoiseParameters
+    {
+        public TerrainNoiseParameters(
+            TerrainGenerationBackend generationBackend,
+            NoiseChannelParameters height,
+            NoiseChannelParameters moisture,
+            NoiseChannelParameters temperature)
+        {
+            GenerationBackend = generationBackend;
+            Height = height;
+            Moisture = moisture;
+            Temperature = temperature;
+        }
+
+        public TerrainGenerationBackend GenerationBackend { get; }
+        public NoiseChannelParameters Height { get; }
+        public NoiseChannelParameters Moisture { get; }
+        public NoiseChannelParameters Temperature { get; }
+
+        public bool SupportsAsyncChunkGeneration =>
+            Height.SupportsAsyncSampling &&
+            Moisture.SupportsAsyncSampling &&
+            Temperature.SupportsAsyncSampling;
+    }
+
+    public static class NoiseGenerator
+    {
+        public static TerrainNoiseParameters CreateParameters(NoiseSettings settings)
         {
             if (settings == null)
             {
@@ -68,197 +181,125 @@ namespace ProceduralTerrainToolkit
 
             settings.Validate();
 
-            Seed = settings.seed;
-            Scale = settings.scale;
-            Octaves = settings.octaves;
-            Persistence = settings.persistence;
-            Lacunarity = settings.lacunarity;
-            NormalizationMode = settings.normalizationMode;
-            octaveOffsets = new Vector2[Octaves];
+            return new TerrainNoiseParameters(
+                settings.generationBackend,
+                CreateChannelParameters(settings.baseSeed, settings.height),
+                CreateChannelParameters(settings.baseSeed, settings.moisture),
+                CreateChannelParameters(settings.baseSeed, settings.temperature));
+        }
 
-            System.Random random = new System.Random(Seed);
+        public static NoiseChannelParameters CreateChannelParameters(int baseSeed, NoiseChannelSettings settings)
+        {
+            if (settings == null)
+            {
+                throw new ArgumentNullException(nameof(settings));
+            }
+
+            settings.Validate();
+
+            int channelSeed = baseSeed + settings.seedOffset;
+            float maxPossibleHeight = CalculateMaxPossibleAmplitude(settings.octaves, settings.persistence);
+
+            return new NoiseChannelParameters(
+                channelSeed,
+                settings.scale,
+                settings.octaves,
+                settings.persistence,
+                settings.lacunarity,
+                new float2(settings.offset.x, settings.offset.y),
+                settings.normalizationMode,
+                maxPossibleHeight);
+        }
+
+        public static float3 SampleTerrain(float2 worldPosition, in TerrainNoiseParameters parameters)
+        {
+            return new float3(
+                SampleNormalized(worldPosition, parameters.Height),
+                SampleNormalized(worldPosition, parameters.Moisture),
+                SampleNormalized(worldPosition, parameters.Temperature));
+        }
+
+        public static float SampleNormalized(float2 worldPosition, in NoiseChannelParameters parameters)
+        {
+            if (!parameters.SupportsAsyncSampling)
+            {
+                throw new InvalidOperationException("Asynchronous terrain generation requires Global normalization so streamed chunks agree on a shared value range.");
+            }
+
+            return NormalizeGlobal(SampleRaw(worldPosition, parameters), parameters.MaxPossibleHeight);
+        }
+
+        public static float SampleRaw(float2 worldPosition, in NoiseChannelParameters parameters)
+        {
+            float amplitude = 1f;
+            float frequency = 1f;
+            float noiseValue = 0f;
+
+            for (int octaveIndex = 0; octaveIndex < parameters.Octaves; octaveIndex++)
+            {
+                float2 samplePosition = ((worldPosition + parameters.Offset) / parameters.Scale) * frequency;
+                noiseValue += SampleSmoothValueNoise(samplePosition, parameters.Seed + (octaveIndex * 1013)) * amplitude;
+
+                amplitude *= parameters.Persistence;
+                frequency *= parameters.Lacunarity;
+            }
+
+            return noiseValue;
+        }
+
+        public static float NormalizeGlobal(float rawNoiseValue, float maxPossibleHeight)
+        {
+            float safeMaxHeight = math.max(maxPossibleHeight, 0.0001f);
+            return math.saturate((rawNoiseValue + safeMaxHeight) / (2f * safeMaxHeight));
+        }
+
+        public static float CalculateMaxPossibleAmplitude(int octaves, float persistence)
+        {
             float amplitude = 1f;
             float maxPossibleHeight = 0f;
 
-            for (int octaveIndex = 0; octaveIndex < Octaves; octaveIndex++)
+            for (int octaveIndex = 0; octaveIndex < math.max(1, octaves); octaveIndex++)
             {
-                float offsetX = random.Next(-100000, 100001) + settings.offset.x;
-                float offsetY = random.Next(-100000, 100001) + settings.offset.y;
-                octaveOffsets[octaveIndex] = new Vector2(offsetX, offsetY);
-
                 maxPossibleHeight += amplitude;
-                amplitude *= Persistence;
+                amplitude *= math.saturate(persistence);
             }
 
-            MaxPossibleHeight = Mathf.Max(maxPossibleHeight, 0.0001f);
+            return math.max(maxPossibleHeight, 0.0001f);
         }
 
-        public float SampleRaw(float worldX, float worldZ)
+        public static float SampleSmoothValueNoise(float2 samplePosition, int seed)
         {
-            if (!IsValid)
-            {
-                throw new InvalidOperationException("NoiseSamplingContext is not initialized. Create it with NoiseGenerator.CreateContext.");
-            }
+            int2 cell = (int2)math.floor(samplePosition);
+            float2 fraction = math.frac(samplePosition);
+            float2 smoothed = fraction * fraction * (3f - (2f * fraction));
 
-            float amplitude = 1f;
-            float frequency = 1f;
-            float noiseHeight = 0f;
+            float value00 = Hash01(cell, seed);
+            float value10 = Hash01(cell + new int2(1, 0), seed);
+            float value01 = Hash01(cell + new int2(0, 1), seed);
+            float value11 = Hash01(cell + new int2(1, 1), seed);
 
-            for (int octaveIndex = 0; octaveIndex < Octaves; octaveIndex++)
-            {
-                Vector2 octaveOffset = octaveOffsets[octaveIndex];
-                float sampleX = ((worldX + octaveOffset.x) / Scale) * frequency;
-                float sampleZ = ((worldZ + octaveOffset.y) / Scale) * frequency;
-                float perlinValue = (Mathf.PerlinNoise(sampleX, sampleZ) * 2f) - 1f;
+            float bottom = math.lerp(value00, value10, smoothed.x);
+            float top = math.lerp(value01, value11, smoothed.x);
 
-                noiseHeight += perlinValue * amplitude;
-                amplitude *= Persistence;
-                frequency *= Lacunarity;
-            }
-
-            return noiseHeight;
+            return (math.lerp(bottom, top, smoothed.y) * 2f) - 1f;
         }
 
-        public float SampleNormalized(float worldX, float worldZ)
+        private static float Hash01(int2 lattice, int seed)
         {
-            if (NormalizationMode == NoiseNormalizationMode.Local)
-            {
-                throw new InvalidOperationException("Local normalization requires a sampled map. Use NoiseGenerator.FillHeightMap or GenerateHeightMap instead.");
-            }
+            uint x = (uint)lattice.x;
+            uint y = (uint)lattice.y;
+            uint s = (uint)seed;
 
-            return NoiseGenerator.NormalizeGlobal(SampleRaw(worldX, worldZ), MaxPossibleHeight);
-        }
-    }
+            uint hash = x * 0x1f123bb5u;
+            hash ^= y * 0x05491333u;
+            hash ^= s * 0x9e3779b9u;
+            hash ^= hash >> 15;
+            hash *= 0x85ebca6bu;
+            hash ^= hash >> 13;
+            hash *= 0xc2b2ae35u;
+            hash ^= hash >> 16;
 
-    public static class NoiseGenerator
-    {
-        public static NoiseSamplingContext CreateContext(NoiseSettings settings)
-        {
-            return new NoiseSamplingContext(settings);
-        }
-
-        public static float SampleHeight(float worldX, float worldZ, NoiseSettings settings)
-        {
-            NoiseSamplingContext context = CreateContext(settings);
-
-            if (context.NormalizationMode == NoiseNormalizationMode.Local)
-            {
-                throw new InvalidOperationException("NoiseGenerator.SampleHeight does not support Local normalization because a single sample has no map-wide min/max range. Use SampleRawHeight, FillHeightMap, or GenerateHeightMap instead.");
-            }
-
-            return context.SampleNormalized(worldX, worldZ);
-        }
-
-        public static float SampleRawHeight(float worldX, float worldZ, NoiseSettings settings)
-        {
-            NoiseSamplingContext context = CreateContext(settings);
-            return context.SampleRaw(worldX, worldZ);
-        }
-
-        public static float[] GenerateHeightMap(int width, int height, Vector2 worldOrigin, Vector2 sampleSpacing, NoiseSettings settings)
-        {
-            NoiseSamplingContext context = CreateContext(settings);
-            float[] heightMap = new float[width * height];
-            FillHeightMap(heightMap, width, height, worldOrigin, sampleSpacing, in context);
-            return heightMap;
-        }
-
-        public static void FillHeightMap(float[] destination, int width, int height, Vector2 worldOrigin, Vector2 sampleSpacing, in NoiseSamplingContext context)
-        {
-            ValidateMapArguments(destination, width, height);
-
-            if (!context.IsValid)
-            {
-                throw new InvalidOperationException("NoiseSamplingContext is not initialized. Create it with NoiseGenerator.CreateContext.");
-            }
-
-            if (context.NormalizationMode == NoiseNormalizationMode.Local)
-            {
-                FillLocalNormalizedHeightMap(destination, width, height, worldOrigin, sampleSpacing, in context);
-                return;
-            }
-
-            int index = 0;
-            for (int y = 0; y < height; y++)
-            {
-                float sampleZ = worldOrigin.y + (y * sampleSpacing.y);
-
-                for (int x = 0; x < width; x++)
-                {
-                    float sampleX = worldOrigin.x + (x * sampleSpacing.x);
-                    destination[index] = context.SampleNormalized(sampleX, sampleZ);
-                    index++;
-                }
-            }
-        }
-
-        public static float NormalizeGlobal(float rawNoiseHeight, float maxPossibleHeight)
-        {
-            float safeMaxHeight = Mathf.Max(maxPossibleHeight, 0.0001f);
-            return Mathf.Clamp01((rawNoiseHeight + safeMaxHeight) / (2f * safeMaxHeight));
-        }
-
-        private static void FillLocalNormalizedHeightMap(float[] destination, int width, int height, Vector2 worldOrigin, Vector2 sampleSpacing, in NoiseSamplingContext context)
-        {
-            int requiredLength = width * height;
-            float minimumHeight = float.PositiveInfinity;
-            float maximumHeight = float.NegativeInfinity;
-            int index = 0;
-
-            for (int y = 0; y < height; y++)
-            {
-                float sampleZ = worldOrigin.y + (y * sampleSpacing.y);
-
-                for (int x = 0; x < width; x++)
-                {
-                    float sampleX = worldOrigin.x + (x * sampleSpacing.x);
-                    float rawHeight = context.SampleRaw(sampleX, sampleZ);
-
-                    destination[index] = rawHeight;
-                    minimumHeight = Mathf.Min(minimumHeight, rawHeight);
-                    maximumHeight = Mathf.Max(maximumHeight, rawHeight);
-                    index++;
-                }
-            }
-
-            if (Mathf.Approximately(minimumHeight, maximumHeight))
-            {
-                for (int i = 0; i < requiredLength; i++)
-                {
-                    destination[i] = 0.5f;
-                }
-
-                return;
-            }
-
-            for (int i = 0; i < requiredLength; i++)
-            {
-                destination[i] = Mathf.InverseLerp(minimumHeight, maximumHeight, destination[i]);
-            }
-        }
-
-        private static void ValidateMapArguments(float[] destination, int width, int height)
-        {
-            if (destination == null)
-            {
-                throw new ArgumentNullException(nameof(destination));
-            }
-
-            if (width < 1)
-            {
-                throw new ArgumentOutOfRangeException(nameof(width), "Height map width must be at least 1.");
-            }
-
-            if (height < 1)
-            {
-                throw new ArgumentOutOfRangeException(nameof(height), "Height map height must be at least 1.");
-            }
-
-            int requiredLength = width * height;
-            if (destination.Length < requiredLength)
-            {
-                throw new ArgumentException($"Destination array is too small. Required {requiredLength} entries but received {destination.Length}.", nameof(destination));
-            }
+            return (hash & 0x00ffffffu) / 16777215f;
         }
     }
 }

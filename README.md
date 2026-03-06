@@ -1,194 +1,152 @@
 # Procedural Terrain Toolkit
 
-Procedural Terrain Toolkit is an open-source Unity package for streaming deterministic terrain chunks around a moving viewer without constant instantiate/destroy churn. It is designed as a foundational terrain engine for fast traversal games such as off-road driving simulators, survival sandboxes, and physics-heavy open worlds where terrain needs to appear continuous while runtime spikes stay under control.
+Procedural Terrain Toolkit is a beta-stage Unity Package Manager package for streaming chunked terrain in traversal-heavy games without blocking the main thread. The package combines Burst-compiled jobs, optional GPU noise generation through compute shaders and `AsyncGPUReadback`, dual-noise biome signals, and vertex-color splat weights for lightweight terrain shading workflows.
 
-## Goals
+## Beta Highlights
 
-- Stream terrain around a player or vehicle in chunk-sized regions
-- Reuse chunk GameObjects through pooling to reduce garbage collection pressure
-- Generate deterministic terrain from layered Perlin noise so chunks stitch together seamlessly
-- Keep the runtime API modular so contributors can extend it with biomes, LODs, splat maps, Jobs/Burst, or physics features
-- Ship as a lightweight Unity Package Manager package that can be dropped into a fresh repository
+- **Burst + Jobs mesh generation** using `IJobParallelFor` for noise sampling, vertices, normals, UVs, and triangle buffers
+- **Optional GPU noise generation** via `NoiseGenerator.compute` and an async C# dispatcher
+- **Dual-noise biomes** with synchronized **moisture** and **temperature** maps alongside terrain height
+- **Procedural splat weights** encoded into vertex colors:
+  - **R** = grass
+  - **G** = rock
+  - **B** = sand
+  - **A** = snow
+- **Chunk pooling and async completion** designed for high-speed traversal
+- **GitHub beta release automation** for tagged prereleases
 
-## Included Files
+## Package Layout
 
 ```text
 ProceduralTerrainToolkit/
+├── .github/
+│   └── workflows/
+│       └── release.yml
 ├── package.json
 ├── README.md
 └── Runtime/
     ├── ProceduralTerrainToolkit.asmdef
-    └── Scripts/
-        ├── ChunkManager.cs
-        ├── NoiseGenerator.cs
-        └── TerrainChunk.cs
+    ├── Scripts/
+    │   ├── ChunkManager.cs
+    │   ├── GpuNoiseGenerator.cs
+    │   ├── NoiseGenerator.cs
+    │   └── TerrainChunk.cs
+    └── Shaders/
+        └── NoiseGenerator.compute
 ```
 
-## Feature Overview
+## Runtime Architecture
 
-### `NoiseGenerator.cs`
+### 1. ChunkManager
 
-`NoiseGenerator` is a static utility that creates deterministic height data using layered Perlin noise. It supports:
-
-- seed-based octave offsets
-- octave blending
-- persistence and lacunarity
-- global or local normalization
-- reusable sampling contexts for lower runtime overhead
-- bulk height-map generation for chunk builds
-
-### `TerrainChunk.cs`
-
-`TerrainChunk` represents one pooled terrain tile. Each chunk:
-
-- caches its `Mesh`, `MeshFilter`, and `MeshRenderer`
-- builds a grid mesh from normalized height samples
-- reuses managed buffers for heights, vertices, UVs, and triangle indices
-- can optionally generate a `MeshCollider`
-- exposes chunk coordinate and world bounds information
-
-### `ChunkManager.cs`
-
-`ChunkManager` drives the system at runtime. It:
+`ChunkManager` is the streaming coordinator. It:
 
 - tracks a viewer transform
-- converts world coordinates into chunk coordinates
-- keeps active chunks in a dictionary keyed by `Vector2Int`
-- recycles out-of-range chunks into a pool
-- refreshes visible chunks on a configurable cadence or after meaningful viewer movement
-- rebuilds chunks when terrain or noise settings change
+- determines which chunk coordinates should be visible
+- reuses chunk GameObjects from a pool
+- services async chunk pipelines every frame
+- rebuilds visible chunks when generation settings change
+- chooses between CPU Burst jobs and GPU compute noise generation
 
-## Why Chunked Streaming Matters
+### 2. TerrainChunk
 
-Infinite terrain is rarely truly infinite. Instead, the world is segmented into fixed-size chunks and only the region near the viewer stays active. This approach is critical for fast traversal because it:
+`TerrainChunk` owns the per-chunk generation state. It:
 
-1. bounds the number of active meshes in memory
-2. avoids rebuilding the entire world as the viewer moves
-3. allows chunk reuse through pooling
-4. makes future LOD and background generation strategies easier to layer in
+- schedules Burst jobs for CPU terrain sampling and mesh buffer generation
+- waits for `AsyncGPUReadback` completion without blocking the main thread
+- schedules follow-up jobs after GPU data becomes available
+- applies mesh data only after jobs finish
+- delays pool reuse when a chunk is still finishing background work
 
-When a vehicle crosses chunk boundaries at speed, the manager computes which chunk coordinates should remain visible and either:
+### 3. NoiseGenerator
 
-- reuses an existing active chunk,
-- reactivates a pooled chunk, or
-- instantiates a new chunk only when the pool is empty.
+`NoiseGenerator` converts authoring settings into runtime noise parameters and exposes Burst-safe sampling helpers. The CPU and GPU paths share the same layered value-noise model so biome data remains consistent regardless of the backend.
 
-That reuse pattern is one of the easiest ways to reduce GC spikes in an infinite world prototype.
+### 4. GpuNoiseGenerator
 
-## Mathematical Foundation
+`GpuNoiseGenerator` dispatches the compute shader, allocates the temporary GPU buffer, and converts the async readback into a persistent native array so `TerrainChunk` can continue the pipeline through jobs.
 
-The toolkit currently uses octave-based Perlin noise, where each octave contributes a higher-frequency, lower-amplitude detail layer.
+## Async Generation Flow
 
-For each sample position `(x, z)`:
+### CPU Burst path
 
-```text
-noise(x, z) = Σ(A_i * (2 * Perlin(F_i * x', F_i * z') - 1))
-```
+1. `ChunkManager` requests a build for a chunk.
+2. `TerrainChunk` schedules a Burst job to sample:
+   - height
+   - moisture
+   - temperature
+3. A second Burst job converts those samples into:
+   - vertices
+   - normals
+   - UVs
+   - vertex-color splat weights
+4. A triangle job fills the index buffer in parallel.
+5. The chunk applies the finished mesh only after `JobHandle.IsCompleted` reports ready.
 
-Where:
+### GPU compute path
 
-- `A_i` is the octave amplitude
-- `F_i` is the octave frequency
-- `x'` and `z'` are world coordinates adjusted by seed-derived offsets
+1. `ChunkManager` requests a build with GPU generation enabled.
+2. `TerrainChunk` asks `GpuNoiseGenerator` to dispatch `NoiseGenerator.compute`.
+3. The compute shader writes height/moisture/temperature samples into a structured buffer.
+4. `AsyncGPUReadback.Request` returns immediately, so the frame continues.
+5. Once Unity reports the readback complete, `TerrainChunk` schedules jobs that copy the samples into its persistent buffers and builds the mesh.
+6. If GPU support is unavailable, the system logs a warning and falls back to the Burst CPU path.
 
-The amplitude and frequency progressions follow:
+## Noise Model
 
-```text
-A_0 = 1
-A_i = A_(i-1) * persistence
-
-F_0 = 1
-F_i = F_(i-1) * lacunarity
-```
-
-### What this means visually
-
-- **higher octaves** add smaller terrain detail
-- **higher persistence** keeps later octaves stronger, producing rougher terrain
-- **higher lacunarity** increases frequency faster, producing denser fine detail
-- **larger scale** zooms out the terrain pattern
-
-### Global vs Local Normalization
-
-The toolkit exposes two normalization modes:
-
-- **Global**: uses the theoretical maximum octave amplitude to normalize values consistently across chunks
-- **Local**: normalizes from the minimum and maximum values found in the current sampled map
-
-For streamed terrain, **Global normalization is the correct default** because it preserves continuity across chunk boundaries. Local normalization is included for other workflows, but it can make neighboring chunks appear to shift in relative height.
-
-## Chunk Coordinate Mapping
-
-The manager maps world position to chunk coordinates with floor division:
+The toolkit uses layered, deterministic value noise instead of a Unity `Terrain` component dependency. Each channel is computed as fractal noise:
 
 ```text
-chunkX = floor(worldX / chunkSize)
-chunkZ = floor(worldZ / chunkSize)
+channel(x, z) = Σ(amplitude_i * valueNoise(frequency_i * (world + offset)))
 ```
 
-This matters because the same world position always resolves to the same chunk coordinate, including in negative world space. That deterministic mapping is what allows:
+Each octave uses:
 
-- pooling without losing track of logical world placement
-- seamless noise sampling at chunk edges
-- consistent rebuilds when a chunk is recycled
+```text
+amplitude_(i+1) = amplitude_i * persistence
+frequency_(i+1) = frequency_i * lacunarity
+```
 
-## Mesh Generation Strategy
+The resulting raw value is normalized against the theoretical maximum amplitude sum, which is why **Global normalization** is required for the async streaming path. Every chunk agrees on the same range, so seams remain stable while chunks are built independently.
 
-Each chunk generates a regular grid mesh:
+## Biome Maps
 
-- `vertexResolution x vertexResolution` vertices
-- `(vertexResolution - 1)^2 * 2` triangles
-- UVs based on configurable tiling
+Every sample stores three terrain signals:
 
-Heights are sampled in world space rather than chunk-local pseudo-random space, which means the final edge row of one chunk lines up with the first edge row of the next chunk. That is the key requirement for seamless chunk stitching.
+- **Height**: drives mesh displacement
+- **Moisture**: favors grass or sand depending on altitude
+- **Temperature**: favors snow in colder, higher regions
 
-## Performance Considerations
+These channels are computed in lockstep so biome classification does not require a second sampling pass on the main thread.
 
-This package is written for clarity and production-minded extension, but it already includes several practical performance choices:
+## Procedural Splat Weights
 
-- chunk pooling instead of frequent `Instantiate` and `Destroy`
-- reusable managed buffers inside `TerrainChunk`
-- shared material assignment across chunks
-- refresh throttling via `updateIntervalSeconds`
-- early refreshes only when the viewer moves far enough
-- reusable noise sampling context derived from validated settings
+The default surface classifier produces four blend weights:
 
-### What it does **not** do yet
+- **Grass**: moderate slopes with decent moisture
+- **Rock**: steep slopes
+- **Sand**: low altitude and dry areas
+- **Snow**: high altitude and cold areas
 
-This first version intentionally stops short of more specialized systems such as:
-
-- burst-compiled mesh jobs
-- background worker threads
-- distance-based LOD meshes
-- biome blending
-- splat/texture painting
-- vegetation placement
-- road carving or erosion simulation
-
-Those are good future extensions once the package contract is stable.
+The weights are stored in vertex colors so you can plug them into a custom shader, Shader Graph, URP/HDRP lit shader extension, or material property workflow without needing Unity's terrain splat system.
 
 ## Installation
 
-### Option 1: Git URL via Unity Package Manager
+### Option 1: Install from Git URL
 
-1. Push this folder structure to a Git repository.
-2. Open your Unity project.
-3. Open `Window > Package Manager`.
-4. Click the `+` button.
-5. Choose **Add package from git URL...**
-6. Paste the repository URL.
-
-Example:
+1. Open your Unity project.
+2. Open `Window > Package Manager`.
+3. Click the `+` menu.
+4. Choose **Add package from git URL...**
+5. Enter:
 
 ```text
-https://github.com/your-org/procedural-terrain-toolkit.git
+https://github.com/Markgatcha/ProceduralTerrainToolkit.git
 ```
 
-### Option 2: Local package
+### Option 2: Local development package
 
-1. Copy the `ProceduralTerrainToolkit` folder somewhere accessible on disk.
-2. In your Unity project, open `Packages/manifest.json`.
-3. Add a local file dependency:
+Edit your Unity project's `Packages/manifest.json`:
 
 ```json
 {
@@ -198,162 +156,94 @@ https://github.com/your-org/procedural-terrain-toolkit.git
 }
 ```
 
-### Option 3: Embedded package
+## Package Dependencies
 
-Place the folder directly under your Unity project's `Packages/` directory:
+The beta package declares:
 
-```text
-YourUnityProject/
-└── Packages/
-    └── ProceduralTerrainToolkit/
-```
+- `com.unity.burst`
+- `com.unity.collections`
+- `com.unity.mathematics`
 
-## Unity Version
+Target editor version: **Unity 2022.3.17 LTS or newer in the 2022.3 line**
 
-- Minimum target: **Unity 2022.3.17 LTS**
+## Scene Setup
 
-The package has been structured around standard runtime APIs available in Unity 2022 LTS.
+1. Create an empty GameObject such as `Terrain System`.
+2. Add `ChunkManager`.
+3. Assign:
+   - a viewer transform
+   - a terrain material
+   - optionally `Runtime/Shaders/NoiseGenerator.compute` when using GPU generation
+4. Configure `TerrainChunkSettings` and `NoiseSettings`.
+5. Press Play.
 
-## Basic Usage
+## Recommended Beta Defaults
 
-### 1. Import the package
-
-Install the package through one of the methods above.
-
-### 2. Create a terrain material
-
-Create or assign a material that can be shared across all streamed chunks. A simple lit material is enough for initial testing.
-
-### 3. Add `ChunkManager` to a scene object
-
-Create an empty GameObject such as `Terrain System`, then add the `ChunkManager` component.
-
-### 4. Assign the viewer
-
-Drag your player, vehicle, or camera rig transform into the `Viewer` field.
-
-### 5. Configure chunk settings
-
-Recommended starting values:
+### Chunk settings
 
 - `Chunk Size`: `128`
 - `Vertex Resolution`: `65`
 - `Height Scale`: `32`
+- `Job Batch Size`: `64`
 - `Generate Collider`: `false`
+
+### Streaming settings
+
 - `Visible Chunk Radius`: `4`
 - `Update Interval Seconds`: `0.1`
 - `Viewer Movement Threshold`: `8`
 
-### 6. Configure noise settings
+### Noise settings
 
-Recommended starting values:
+- Backend: `CpuBurstJobs` for universal compatibility
+- Height scale: `128`
+- Moisture scale: `192`
+- Temperature scale: `256`
+- All channels: `Global` normalization
 
-- `Scale`: `128`
-- `Octaves`: `4`
-- `Persistence`: `0.5`
-- `Lacunarity`: `2.0`
-- `Normalization Mode`: `Global`
+## Material / Shader Integration
 
-### 7. Press Play
+The mesh renderer receives vertex colors as splat weights. A typical shader setup is:
 
-When the scene starts:
+- sample 4 terrain textures
+- multiply each sample by the corresponding vertex-color channel
+- normalize or blend in the fragment stage
 
-- the manager validates the configuration,
-- creates a reusable chunk root,
-- generates the noise sampling context,
-- builds the initial visible chunk set,
-- and then streams chunks as the viewer moves.
+This keeps the package renderer-agnostic and works in Built-in, URP, or HDRP with a compatible material setup.
 
-## Runtime Scripting Example
+## GitHub Beta Release Workflow
 
-The package is primarily inspector-driven, but the manager also exposes runtime hooks:
+The repository now includes `.github/workflows/release.yml`.
 
-```csharp
-using ProceduralTerrainToolkit;
-using UnityEngine;
+When you push a tag such as:
 
-public sealed class TerrainBootstrapExample : MonoBehaviour
-{
-    [SerializeField] private ChunkManager chunkManager;
-    [SerializeField] private Transform vehicle;
-    [SerializeField] private Material terrainMaterial;
-
-    private void Start()
-    {
-        chunkManager.SetViewer(vehicle);
-        chunkManager.SetTerrainMaterial(terrainMaterial);
-
-        chunkManager.NoiseSettings.seed = 2026;
-        chunkManager.NoiseSettings.scale = 180f;
-        chunkManager.ChunkSettings.chunkSize = 160f;
-
-        chunkManager.MarkSettingsDirty();
-        chunkManager.ForceRefresh();
-    }
-}
+```text
+v0.2.0-beta.1
 ```
 
-## Extension Ideas
+the workflow:
 
-### Add colliders only where needed
+1. checks out the repository
+2. validates that the tag matches `package.json`
+3. copies the package contents into a staging directory
+4. builds `.zip` and `.tgz` archives
+5. creates a **GitHub prerelease** and uploads the package archives
 
-Collider generation is off by default because physics mesh updates are more expensive than render mesh updates. For driving gameplay, a common next step is to enable colliders only:
+## Current Trade-Offs
 
-- near the viewer,
-- on gameplay-critical chunks,
-- or on a lower-resolution collision mesh.
+- Mesh application still occurs on the main thread because Unity mesh objects are main-thread-owned.
+- GPU readback is asynchronous, but the copied data still needs to be consumed by jobs before rendering.
+- Global normalization is required for the async terrain path.
+- Collider generation is still more expensive than render-only chunks; keep it disabled unless the gameplay layer requires it.
 
-### Add biomes
+## Suggested Next Milestones
 
-You can extend the system by sampling additional noise fields for:
-
-- moisture
-- heat
-- erosion masks
-- biome selection
-- material blending
-
-### Add LOD
-
-The current grid mesh generation is a clean foundation for chunk LODs. The typical next step is to:
-
-1. keep high-resolution chunks near the viewer
-2. generate lower-resolution meshes farther away
-3. blend or stitch LOD boundaries carefully
-
-### Move generation off the main thread
-
-Once the API stabilizes, the mesh-data stage can be moved into:
-
-- Unity Jobs
-- Burst-compiled jobs
-- task-based worker pipelines
-
-The current package keeps data ownership simple so that refactor is straightforward later.
-
-## Contributor Notes
-
-If you plan to fork or expand the toolkit:
-
-- keep world-space sampling deterministic
-- preserve seam alignment at chunk borders
-- avoid per-frame allocations in the streaming path
-- prefer explicit validation over silent fallbacks
-- test negative-world coordinates, not just positive positions
-
-## Known Trade-Offs
-
-- Extremely high chunk resolutions will still be expensive without multithreaded generation.
-- `Mesh.RecalculateNormals()` is clear and reliable, but it is not the final word in performance optimization.
-- Local normalization is included for completeness, but streamed worlds should stay on Global normalization.
-
-## Next Recommended Milestones
-
-1. add optional LOD meshes
-2. add biome layers
-3. add asynchronous mesh-data generation
-4. add sample scenes and automated play-mode validation
+1. chunk LODs
+2. background normal-map baking
+3. collision-only low-resolution meshes
+4. ECS/DOTS world streaming wrappers
+5. shader graph sample assets under `Samples~`
 
 ## License
 
-Choose the license that fits your repository goals before publishing (for example MIT or Apache-2.0).
+Add the open-source license you want before announcing the beta publicly.

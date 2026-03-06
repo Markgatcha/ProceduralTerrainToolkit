@@ -1,18 +1,32 @@
 {
   "name": "com.proceduralterraintoolkit.core",
-  "version": "0.1.0",
+  "version": "0.2.0-beta.1",
   "displayName": "Procedural Terrain Toolkit",
-  "description": "A runtime-focused Unity package for deterministic chunked terrain streaming, layered noise generation, and low-allocation world traversal.",
+  "description": "A beta Unity package for asynchronous chunked terrain streaming with Burst jobs, GPU noise readbacks, biome maps, and procedural splat weights.",
   "unity": "2022.3",
   "unityRelease": "17f1",
+  "documentationUrl": "https://github.com/Markgatcha/ProceduralTerrainToolkit",
+  "changelogUrl": "https://github.com/Markgatcha/ProceduralTerrainToolkit/releases",
+  "dependencies": {
+    "com.unity.burst": "1.8.12",
+    "com.unity.collections": "2.1.4",
+    "com.unity.mathematics": "1.2.6"
+  },
   "keywords": [
     "terrain",
     "procedural-generation",
     "streaming",
     "infinite-world",
-    "unity"
+    "unity",
+    "burst",
+    "compute-shader",
+    "biomes"
   ],
   "author": {
     "name": "Procedural Terrain Toolkit Contributors"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Markgatcha/ProceduralTerrainToolkit.git"
   }
 }

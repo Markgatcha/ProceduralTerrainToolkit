@@ -1,0 +1,151 @@
+#pragma kernel GenerateNoiseMaps
+
+#define MAX_OCTAVES 12
+
+RWStructuredBuffer<float3> _TerrainSamples;
+
+int _Resolution;
+float _CellSize;
+float2 _WorldOrigin;
+
+int _HeightSeed;
+float _HeightScale;
+int _HeightOctaves;
+float _HeightPersistence;
+float _HeightLacunarity;
+float2 _HeightOffset;
+float _HeightMaxPossible;
+
+int _MoistureSeed;
+float _MoistureScale;
+int _MoistureOctaves;
+float _MoisturePersistence;
+float _MoistureLacunarity;
+float2 _MoistureOffset;
+float _MoistureMaxPossible;
+
+int _TemperatureSeed;
+float _TemperatureScale;
+int _TemperatureOctaves;
+float _TemperaturePersistence;
+float _TemperatureLacunarity;
+float2 _TemperatureOffset;
+float _TemperatureMaxPossible;
+
+uint HashBits(uint value)
+{
+    value ^= value >> 15;
+    value *= 0x85ebca6bu;
+    value ^= value >> 13;
+    value *= 0xc2b2ae35u;
+    value ^= value >> 16;
+    return value;
+}
+
+float Hash01(int2 lattice, uint seed)
+{
+    uint x = asuint(lattice.x);
+    uint y = asuint(lattice.y);
+
+    uint hash = x * 0x1f123bb5u;
+    hash ^= y * 0x05491333u;
+    hash ^= seed * 0x9e3779b9u;
+    hash = HashBits(hash);
+
+    return (hash & 0x00ffffffu) / 16777215.0;
+}
+
+float SampleValueNoise(float2 samplePosition, uint seed)
+{
+    int2 cell = (int2)floor(samplePosition);
+    float2 fraction = frac(samplePosition);
+    float2 smoothed = fraction * fraction * (3.0 - (2.0 * fraction));
+
+    float value00 = Hash01(cell, seed);
+    float value10 = Hash01(cell + int2(1, 0), seed);
+    float value01 = Hash01(cell + int2(0, 1), seed);
+    float value11 = Hash01(cell + int2(1, 1), seed);
+
+    float bottom = lerp(value00, value10, smoothed.x);
+    float top = lerp(value01, value11, smoothed.x);
+
+    return (lerp(bottom, top, smoothed.y) * 2.0) - 1.0;
+}
+
+float SampleFractalNoise(
+    float2 worldPosition,
+    int seed,
+    float scale,
+    int octaves,
+    float persistence,
+    float lacunarity,
+    float2 offset,
+    float maxPossibleHeight)
+{
+    float amplitude = 1.0;
+    float frequency = 1.0;
+    float value = 0.0;
+
+    [loop]
+    for (int octaveIndex = 0; octaveIndex < MAX_OCTAVES; octaveIndex++)
+    {
+        if (octaveIndex >= octaves)
+        {
+            break;
+        }
+
+        float safeScale = max(scale, 0.0001);
+        float2 samplePosition = ((worldPosition + offset) / safeScale) * frequency;
+        value += SampleValueNoise(samplePosition, (uint)(seed + (octaveIndex * 1013))) * amplitude;
+
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+
+    float safeMaxPossible = max(maxPossibleHeight, 0.0001);
+    return saturate((value + safeMaxPossible) / (2.0 * safeMaxPossible));
+}
+
+[numthreads(8, 8, 1)]
+void GenerateNoiseMaps(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    if (dispatchThreadId.x >= _Resolution || dispatchThreadId.y >= _Resolution)
+    {
+        return;
+    }
+
+    int sampleIndex = (dispatchThreadId.y * _Resolution) + dispatchThreadId.x;
+    float2 worldPosition = _WorldOrigin + float2(dispatchThreadId.x * _CellSize, dispatchThreadId.y * _CellSize);
+
+    float height = SampleFractalNoise(
+        worldPosition,
+        _HeightSeed,
+        _HeightScale,
+        _HeightOctaves,
+        _HeightPersistence,
+        _HeightLacunarity,
+        _HeightOffset,
+        _HeightMaxPossible);
+
+    float moisture = SampleFractalNoise(
+        worldPosition,
+        _MoistureSeed,
+        _MoistureScale,
+        _MoistureOctaves,
+        _MoisturePersistence,
+        _MoistureLacunarity,
+        _MoistureOffset,
+        _MoistureMaxPossible);
+
+    float temperature = SampleFractalNoise(
+        worldPosition,
+        _TemperatureSeed,
+        _TemperatureScale,
+        _TemperatureOctaves,
+        _TemperaturePersistence,
+        _TemperatureLacunarity,
+        _TemperatureOffset,
+        _TemperatureMaxPossible);
+
+    _TerrainSamples[sampleIndex] = float3(height, moisture, temperature);
+}
