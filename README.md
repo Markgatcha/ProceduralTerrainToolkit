@@ -2,6 +2,8 @@
 
 Procedural Terrain Toolkit is an open-source Unity package for streaming deterministic terrain chunks around a moving viewer without constant instantiate/destroy churn. It is designed as a foundational terrain engine for fast traversal games such as off-road driving simulators, survival sandboxes, and physics-heavy open worlds where terrain needs to appear continuous while runtime spikes stay under control.
 
+If you'd like to contribute, please read [CONTRIBUTING.MD](CONTRIBUTING.MD) for contribution workflow, coding standards, and issue guidelines.
+
 ## Goals
 
 - Stream terrain around a player or vehicle in chunk-sized regions
