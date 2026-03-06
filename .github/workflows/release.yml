@@ -1,4 +1,4 @@
-name: Beta Release
+name: Package Release
 
 on:
   push:
@@ -30,7 +30,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build beta package archives
+      - name: Build package archives
         run: |
           PACKAGE_NAME="ProceduralTerrainToolkit"
           PACKAGE_VERSION="${{ steps.package.outputs.version }}"
@@ -48,10 +48,11 @@ jobs:
           zip -r "${PACKAGE_NAME}-${PACKAGE_VERSION}.zip" "${PACKAGE_NAME}"
           tar -czf "${PACKAGE_NAME}-${PACKAGE_VERSION}.tgz" "${PACKAGE_NAME}"
 
-      - name: Create GitHub prerelease
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: true
+          name: v${{ steps.package.outputs.version }}
+          prerelease: ${{ contains(steps.package.outputs.version, '-') }}
           generate_release_notes: true
           files: |
             build/ProceduralTerrainToolkit-${{ steps.package.outputs.version }}.zip

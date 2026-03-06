@@ -132,17 +132,25 @@ The weights are stored in vertex colors so you can plug them into a custom shade
 
 ## Installation
 
-### Option 1: Install from Git URL
+### Option 1: Install from a tagged Git URL
+
+Using an explicit tag is the safest way to choose between the stable channel and preview builds.
 
 1. Open your Unity project.
 2. Open `Window > Package Manager`.
 3. Click the `+` menu.
 4. Choose **Add package from git URL...**
-5. Enter:
+5. Enter one of these URLs:
 
 ```text
-https://github.com/Markgatcha/ProceduralTerrainToolkit.git
+Stable release:
+https://github.com/Markgatcha/ProceduralTerrainToolkit.git#v0.1.0
+
+Latest beta prerelease:
+https://github.com/Markgatcha/ProceduralTerrainToolkit.git#v0.2.0-beta.1
 ```
+
+If you install from the bare repository URL without `#tag`, Unity follows the repository's default branch, which may contain beta or in-progress work.
 
 ### Option 2: Local development package
 
@@ -211,13 +219,14 @@ The mesh renderer receives vertex colors as splat weights. A typical shader setu
 
 This keeps the package renderer-agnostic and works in Built-in, URP, or HDRP with a compatible material setup.
 
-## GitHub Beta Release Workflow
+## GitHub Release Workflow
 
 The repository now includes `.github/workflows/release.yml`.
 
 When you push a tag such as:
 
 ```text
+v0.1.0
 v0.2.0-beta.1
 ```
 
@@ -227,7 +236,9 @@ the workflow:
 2. validates that the tag matches `package.json`
 3. copies the package contents into a staging directory
 4. builds `.zip` and `.tgz` archives
-5. creates a **GitHub prerelease** and uploads the package archives
+5. creates a GitHub release and uploads the package archives
+
+Tags containing a prerelease suffix such as `-beta.1` are published as **prereleases**. Plain semantic-version tags such as `v0.1.0` are published as **regular releases**.
 
 ## Current Trade-Offs
 
