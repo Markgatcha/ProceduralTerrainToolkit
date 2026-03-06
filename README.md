@@ -244,6 +244,3 @@ the workflow:
 4. ECS/DOTS world streaming wrappers
 5. shader graph sample assets under `Samples~`
 
-## License
-
-Add the open-source license you want before announcing the beta publicly.
