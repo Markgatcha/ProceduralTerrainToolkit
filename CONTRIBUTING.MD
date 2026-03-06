@@ -32,6 +32,6 @@ We follow a "Fork and Pull" workflow:
 To keep the Procedural Terrain Toolkit fast and readable, please adhere to these rules:
 
 - **DOTS First:** If a task can be done in a `SystemBase` or `IJobEntity`, do it there. Avoid `MonoBehaviour.Update` for heavy logic.
-- **Naming:** Use `PascalCase` for methods and public variables; `_camelCase` with an underscore for private fields.
+- **Naming:** Use `PascalCase` for methods and public variables; prefix private fields with an underscore followed by `camelCase` (for example, `_privateField`).
 - **Safety:** Always handle `AsyncGPUReadback` requests safely. Never assume the data is ready on the next frame.
 - **Documentation:** All public methods must have XML comments using `///`.
