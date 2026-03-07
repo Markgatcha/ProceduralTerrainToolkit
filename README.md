@@ -2,7 +2,7 @@
 
 Procedural Terrain Toolkit is a beta-stage Unity Package Manager package for streaming chunked terrain in traversal-heavy games without blocking the main thread. The package combines Burst-compiled jobs, optional GPU noise generation through compute shaders and `AsyncGPUReadback`, dual-noise biome signals, and vertex-color splat weights for lightweight terrain shading workflows.
 
-If you want to contribute, please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a Pull Request.
+If you want to contribute, please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a Pull Request and review the repository [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 
 ## Beta Highlights
 
